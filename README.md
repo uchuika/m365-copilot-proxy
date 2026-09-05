@@ -69,6 +69,11 @@ Each agent session reuses the same M365 conversation (same `sessionId` + `conver
     in by hand once. Required if your tenant has [no TOTP option](#if-your-tenant-has-no-totp-option)
     (push-only MFA, FIDO2, Okta/Ping/Duo).
 
+> **Windows ユーザーへ / On Windows?** See [docs/windows-ja.md](docs/windows-ja.md) — a
+> Japanese-language setup guide covering the Windows-only pitfalls (PATH after install,
+> the `--filter` needed to fetch Playwright's Chromium, PowerShell fence routing) and a
+> troubleshooting flow for the empty-response / no-tool-calls failures.
+
 ### 1. Install
 
 ```sh
