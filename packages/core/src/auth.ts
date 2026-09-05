@@ -47,13 +47,41 @@ function resolveFile(envVar: string, defaultName: string): string {
 const CACHE_FILE = resolveFile("M365_CACHE_FILE", "msal-cache.json");
 const SECRETS_FILE = resolveFile("M365_SECRETS_FILE", "secrets.json");
 
-// Browser identity for both login paths. These defaults are the §11 F25
-// anti-fingerprint config — empirically tuned against AAD's bot scoring for the
-// account this was built on, hence overridable rather than derived: a wrong
-// locale is cosmetic, but silently changing a fingerprint that currently passes
-// is not worth the risk. Set these if AAD treats your automated login as a bot.
-const LOGIN_LOCALE = process.env.M365_LOGIN_LOCALE ?? "en-GB";
-const LOGIN_TIMEZONE = process.env.M365_LOGIN_TIMEZONE ?? "Europe/Copenhagen";
+// Browser identity for the AUTOMATED login path (the interactive path deliberately
+// sets none of this — see loginInteractiveForScopes).
+//
+// A fingerprint is only credible if it is COHERENT. `navigator.platform`, the font
+// list and the UA client hints all report the machine we actually run on, and AAD
+// compares them against the UA string. The previous defaults were a fixed Linux UA
+// plus en-GB / Europe/Copenhagen — correct on the machine F25 was tuned on, but on
+// any other host they describe a machine that does not exist. That is precisely the
+// incoherent-fingerprint failure F25 set out to avoid (it declined to spoof a
+// Windows UA from Linux for this reason); running the same constants on a Windows
+// host just inverts the mismatch and scores WORSE than no override at all.
+//
+// So derive all three from the host, and keep every one overridable — setting the
+// three env vars to the old values restores the previous behaviour exactly.
+const CHROME_VERSION = "146.0.0.0";
+
+function hostUserAgent(): string {
+  const tail = `AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_VERSION} Safari/537.36`;
+  switch (process.platform) {
+    case "win32":
+      return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) ${tail}`;
+    case "darwin":
+      return `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ${tail}`;
+    default:
+      return `Mozilla/5.0 (X11; Linux x86_64) ${tail}`;
+  }
+}
+
+// Locale and timezone are NOT defaulted at all: Chromium already derives both from
+// the OS, and anything we compute is at best the same answer and at worst a worse
+// one. (Node on this Windows host resolves the zone as `Etc/GMT-9`, a valid IANA id
+// that no real Chrome would ever report — passing that through would have *created*
+// the tell we are trying to remove.) Set the env vars to pin them explicitly.
+const LOGIN_LOCALE = process.env.M365_LOGIN_LOCALE;
+const LOGIN_TIMEZONE = process.env.M365_LOGIN_TIMEZONE;
 
 /** Human completes SSO/MFA by hand (§13). Off by default: it opens a real window. */
 function interactiveApprovalEnabled(): boolean {
@@ -125,15 +153,13 @@ const LOGIN_DEBUG_DIR = join(CONFIG_DIR, "login-debug");
 // brand-new unfamiliar device on every single login. Override with M365_BROWSER_PROFILE.
 const BROWSER_PROFILE_DIR = resolveFile("M365_BROWSER_PROFILE", "browser-profile");
 
-// A coherent, non-headless-looking UA that MATCHES the platform we actually run on
-// (Linux). The default headless Chromium advertises `HeadlessChrome/<v>` in both
-// navigator.userAgent AND the HTTP User-Agent header — a direct "I'm a bot" tell that
-// login.microsoftonline.com's device-fingerprinting reads. We override it at the context
-// level (fixes both layers). Deliberately NOT spoofing a different OS: a Windows UA on a
-// Linux navigator.platform is itself an incoherent, flaggable fingerprint (F25 Config-B).
-const LOGIN_USER_AGENT =
-  process.env.M365_LOGIN_UA ??
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+// A non-headless-looking UA that MATCHES the platform we actually run on. The default
+// headless Chromium advertises `HeadlessChrome/<v>` in both navigator.userAgent AND the
+// HTTP User-Agent header — a direct "I'm a bot" tell that login.microsoftonline.com's
+// device-fingerprinting reads. We override it at the context level (fixes both layers).
+// Never spoofing a DIFFERENT OS is the whole point (F25 Config-B): the UA names this
+// host, whatever this host is.
+const LOGIN_USER_AGENT = process.env.M365_LOGIN_UA ?? hostUserAgent();
 
 interface Credentials {
   email: string;
@@ -346,9 +372,9 @@ async function runBrowserLogin(
         "--disable-blink-features=AutomationControlled",
       ],
       userAgent: LOGIN_USER_AGENT,
-      locale: LOGIN_LOCALE,
-      timezoneId: LOGIN_TIMEZONE,
       viewport: { width: 1280, height: 800 },
+      ...(LOGIN_LOCALE ? { locale: LOGIN_LOCALE } : {}),
+      ...(LOGIN_TIMEZONE ? { timezoneId: LOGIN_TIMEZONE } : {}),
     });
     await context.addInitScript(() => {
       // navigator.webdriver === true is the single loudest automation signal.
@@ -489,21 +515,22 @@ async function loginInteractiveForScopes(scopes: string[]): Promise<string> {
   const timeoutMs = interactiveTimeoutMs();
   const { authUrl, verifier } = await buildAuthUrlForScopes(app, scopes);
 
+  // NO fingerprint overrides on this path, by design. The automated path masks the
+  // headless tells because a headless Chromium genuinely cannot pass as a person; here
+  // a person IS sitting in front of a visible window and completing MFA themselves, so
+  // there is nothing to disguise — every signal AAD reads (UA, locale, timezone,
+  // navigator.webdriver) can simply be the truth. Sending a synthetic identity instead
+  // would misrepresent a genuine human sign-in to the tenant's risk engine, and on a
+  // host whose real locale/OS differ from the override it scores worse anyway.
+  // The three M365_LOGIN_* vars still apply if a specific tenant needs them.
   const context = await chromium.launchPersistentContext(BROWSER_PROFILE_DIR, {
     headless: false, // the entire point: a human has to see and drive this
     executablePath: resolveChromiumPath(),
-    args: [
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-blink-features=AutomationControlled",
-    ],
-    userAgent: LOGIN_USER_AGENT,
-    locale: LOGIN_LOCALE,
-    timezoneId: LOGIN_TIMEZONE,
+    args: ["--no-sandbox", "--disable-dev-shm-usage"],
     viewport: { width: 1280, height: 800 },
-  });
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    ...(process.env.M365_LOGIN_UA ? { userAgent: process.env.M365_LOGIN_UA } : {}),
+    ...(LOGIN_LOCALE ? { locale: LOGIN_LOCALE } : {}),
+    ...(LOGIN_TIMEZONE ? { timezoneId: LOGIN_TIMEZONE } : {}),
   });
   const page = context.pages()[0] ?? (await context.newPage());
 
