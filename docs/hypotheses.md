@@ -31,6 +31,195 @@ than "we eyeballed one run." See §M (Methods) for the experimental rig.
   third-party): loopback redirect falsified, `nativeclient` corroborated by two forks
 - §12 — Multi-agent research dig (July 13 2026) + framing A/Bs, and §12.13: tool-less
   requests silently execute in M365's sandbox and return a real (wrong-machine) transcript
+- §15 — Sept 5 2026: the agent can be **licence-gated off** for a whole account
+  (`CopilotExtensibilityNotEnabled`), and what that leaves working. First Windows host.
+
+---
+
+## 15. Sept 5 2026 — `CopilotExtensibilityNotEnabled`: the agent path can be closed per-account
+
+First run of this proxy on a **Windows** host, and on an account whose tenant does not
+enable Copilot extensibility. Both produced findings.
+
+### F26 — Agent publish can 403 for the account, silently degrading every GPT turn 🟢
+**Claim.** `ensureAgent()` can create the bot and then fail at **publish** with a
+licence/policy 403, leaving the proxy on the agent-less path for models that need the
+agent. Verbatim, from `~/.config/opencode-m365/debug.log`:
+
+```
+[agent] Created agent: botId=f61ac6e1-…
+[agent] Publish failed (Failed to publish bot: 403 …)
+[agent] Recreated agent: botId=a5d0bcea-…
+[ERROR] [agent] Agent creation failed: Failed to publish bot: 403
+  { "Code": "CopilotExtensibilityNotEnabled",
+    "Message": "Publishing this agent requires Copilot extensibility, which is not enabled for your account." }
+[model] No agent available   →   agent=none
+```
+
+BAP and PowerPlatform tokens both acquired fine and the environment URL resolved — this
+is **not** an auth failure, and no amount of re-login fixes it. It is a per-account
+capability gate, distinct from the §8.11 "Copilot Studio licence" cost premise: creating
+a bot is permitted, *publishing* it is not.
+**Consequence (measured, n=3 pi runs).** With `agent=none` the GPT path behaves exactly as
+§9/§12.13 predict — it never emits a fence for the harness and instead does the work in
+M365's own `/mnt/data` sandbox, returning either a Teams artifact link or "upload the file
+to this chat". The local working directory is never touched. So on such an account the
+README's recommended `gpt-5.5-think-deeper` is **chat-only**. F23's agent-less Claude path
+would have been the remaining route — but on this account it is closed too (F30).
+**Falsification.** An account with extensibility enabled publishes and gets `agent=<id>`;
+if a `CopilotExtensibilityNotEnabled` account ever tool-calls on the GPT path, this is wrong.
+**Product gap.** The 403 is logged and swallowed. A user without `M365_DEBUG=1` sees only
+a model that "won't use tools", with nothing pointing at the licence gate. Worth surfacing
+as a startup warning, and worth documenting in the README's prerequisites.
+
+### F30 — A `Claude_*` tone can return SILENCE (not an error) on an unentitled account 🟢
+**Claim.** Anthropic tones are not universally available, and an account without them does
+not get a tone-validation error — it gets a **completed turn with no answer**. So the
+account-entitlement failure is indistinguishable from throttle at the proxy's API surface,
+and F13's "no `Disengaged` → it's thread-throttle" heuristic **misdiagnoses it**.
+**Evidence (Sept 5 2026, back-to-back A/B, one proxy, one account, same minute, n=1 each).**
+- `gpt-5.5-think-deeper` → HTTP 200, `"ALIVE"`.
+- `claude-sonnet-4.5` → HTTP 502, empty. Wire trace: handshake OK, `EarlyProgress`
+  ("Queuing things up…"), a throttling frame (`4/600`), then one bot frame carrying
+  **`messageType:"ReferencesListComplete"`, `offense:"None"`, and no text at all**,
+  then `type:3` completion → `WS closed, answer length: 0`. The empty-retry
+  ("Please continue.") returned the same shape. No `Disengaged`, no error frame, no
+  `Failed to invoke 'Chat'` — so the tone passed server-side *validation* and still
+  produced nothing.
+**Reading.** Tone validation (§5, finding 22) proves a tone *exists*, NOT that the calling
+account may use it. Microsoft gates Anthropic models behind a tenant admin opt-in; an
+un-opted-in account appears to be served an empty turn rather than a refusal.
+**Consequence.** On an account that is both `CopilotExtensibilityNotEnabled` (F26) and
+Anthropic-disabled, **every tool-calling route this proxy has is closed** — GPT needs the
+agent, Claude needs the entitlement. Plain chat still works on every GPT tone. That is a
+licensing state, not a bug, and no proxy-side change can lift it.
+**Falsification.** An account with Anthropic models enabled answers on `Claude_Sonnet`; if
+an *entitled* account ever shows this empty+`ReferencesListComplete` shape, this is throttle
+after all and the diagnosis is wrong.
+**Product gap.** The empty-response error text still guesses "content filter, invalid
+agent/session, or transient upstream error" — three wrong answers for this case. When the
+turn completes with `offense:"None"` and no message, an unavailable-tone/entitlement
+hypothesis belongs in that message, and the GPT-control probe above is the one-line check.
+
+### F31 — All 9 framing variants fail agent-less: the reflex is "act in MY sandbox", not "don't act" ⚫
+**Hypothesis.** On an account that cannot publish the agent (F26), some framing variant might
+still flip the GPT chat model into emitting a fence for the harness.
+**Test (Sept 5 2026).** All 9 registered variants, one fresh conversation each (nonce in the
+first user message), `m365-copilot`/magic tone, lean 2-tool set (`bash`+`read`), canonical
+fix-bug task, confab/disengage retries disabled so each run measures *one* unassisted turn,
+60-75 s apart. Rig + raw CSV: `scripts/framing-sweep-out/` (`framing-sweep.mjs`,
+`sweep-magic.csv`, `sweep-tones.csv`).
+**Result. 0/9 tool calls — clean sweep, no variant survives.**
+
+| variant | outcome | dea_score | note |
+|---|---|---|---|
+| baseline / minimal / softened | PROSE | 1.5e-8 / 1.6e-8 / 6.0e-9 | "not present in the accessible workspace" |
+| recency / fewshot / proof_demand | PROSE | 1.1e-8 / 7.7e-9 / 9.2e-9 | "I searched the accessible working area" |
+| react / negative | PROSE | 4.7e-8 / 1.3e-8 | "I inspected the working directory and it is empty" |
+| **persona** | **Disengaged** | — | the only variant to trip the filter |
+
+**The interesting part — it is NOT refusal, and NOT the content filter.** Every `dea_score`
+sits at 1e-8/1e-9, i.e. *cleaner* than ordinary prose (~1e-6); nothing was being suppressed.
+And the replies are not "I can't run commands" — they are "I **inspected** the working
+directory and it is **empty**". The model **did** act: it ran a listing in M365's own
+container and truthfully reported what it saw there. The reflex we are fighting is not
+"don't use tools", it is **"use MY tool, on MY machine"**. Our `<tools>` fences describe a
+filesystem the model has no route to, while it holds a real interpreter it can reach — so
+framing that says "act" is *satisfied* by the wrong environment. That is why wording cannot
+win: the instruction is obeyed, just against the wrong host. Corroborates F23's control
+(agent-less `magic` 0/4) and AGENTS.md's "framing can't flip the turn-1 reflex".
+**`persona` is the F10/F18 tax, live.** The one variant that leans on an identity/role frame
+Disengaged outright — heavier framing buys filter risk, not compliance.
+
+### F32 — Two *different* unavailable-tone signatures 🟢
+Same rig, `baseline` framing, one thread each:
+
+| model → tone | result |
+|---|---|
+| `quick` → `Gpt_Quick` | **502 `Failed to invoke 'Chat' due to an error on the server.`** |
+| `gpt-5.4-quick` → `Gpt_5_4_Quick` | **502 same protocol error** |
+| `gpt-5.5-quick` → `Gpt_5_5_Chat` | 200, PROSE (208 s) |
+
+So a tone the server does not accept fails **loudly** at the protocol level (§5 finding 22's
+validation error), which is precisely what `Claude_Sonnet` did *not* do in F30 — it was
+accepted and returned an empty turn. Two distinct failure modes worth separating when
+diagnosing: **protocol rejection** (retired/unknown tone) vs **silent empty** (known tone,
+account not entitled). Also note `MODEL_TONES` still advertises `Gpt_Quick`/`Gpt_5_4_Quick`
+through `/v1/models`, so a client can pick a tone that 502s every time; the table needs a
+liveness pass.
+**Caveat.** n=1 per tone, single account/day; a 502 could in principle be transient. Re-test
+before pruning the tone table.
+
+### F27 — Disabling the code interpreter does NOT restore fence emission ⚫
+**Hypothesis.** The agent-less path's `CODE_INTERPRETER_OPTIONS_SETS` is what lets the
+model do the work remotely; removing it should push the model back to emitting ```` ```bash ````
+for the harness.
+**Test.** Same pi task (`fix the bug in calc.py`), same model, `M365_NO_CODE_INTERPRETER=1`.
+**Result. Disproved.** The model still refused locally — "upload the file or paste its
+contents" — and the file was untouched. Removing the sandbox does not create the agentic
+reflex; it only removes the wrong place the work was going. Consistent with F23's control
+(agent-less `magic` = 0/4 fences).
+
+### F28 — The remote-artifact guard was English-only, so non-English sessions had no guard 🟢
+**Claim.** `looksLikeRemoteArtifactCompletion()` anchored on a Teams `views/original/` URL
+**plus** an English mutation verb. A Japanese-language session produced the exact §12.13
+failure — "`add` 関数を修正し…" + a `kr-prod.asyncgw.teams.microsoft.com/.../views/original/calc.py`
+link — and matched nothing, so the forced-retry never fired and pi reported success on an
+unmodified file. Every guard of this family inherits the same monolingual assumption.
+**Shipped.** Japanese mutation verbs added to the alternation (`MUTATION_CLAIM`, shared by
+both verb→URL and URL→verb patterns); the anchor requirement is unchanged, so a bare shared
+link still doesn't fire. Regression test uses the live Japanese response verbatim.
+**Next.** `looksLikeConfabulation` / `looksLikeHallucinatedCompletion` are still English-only
+and will mis-pass the same way; the Japanese retry above came back as a confabulation that
+also went undetected.
+
+### F29 — Windows: the `m365-proxy` launcher never reached the server 🟢
+`bin/m365-proxy.mjs` passed a bare path to `await import()`. On Windows that is `C:\…`,
+which the ESM loader rejects (`ERR_UNSUPPORTED_ESM_URL_SCHEME`, "Received protocol 'c:'"),
+so the published binary and `pnpm run proxy` were dead on Windows — only `pnpm run dev`
+(Nitro direct) worked. Fixed with `pathToFileURL()`. Related: `fenced.test.ts` asserted on
+`formatFencedToolDefinitions()`'s composed output, which reads `process.platform`, so
+`pnpm test` failed on any Windows host; the platform is now injectable (matching
+`hostPlatformNote`'s existing seam) and both directions are covered.
+
+### F33 — The F25 login fingerprint was host-specific, so off its host it was the tell 🟢
+**Claim.** F25's config (fixed Linux UA + `en-GB` + `Europe/Copenhagen`) is coherent only on
+the machine it was tuned on. Everywhere else the UA names an OS that `navigator.platform`,
+the font list and the UA client hints all contradict — the exact incoherence F25 refused to
+create when it declined to spoof Windows from Linux. Run on this Windows host, the defaults
+inverted that mismatch and scored *worse* than sending nothing.
+**Shipped.**
+- UA now derives from `process.platform` (win32 / darwin / else), so it removes Chromium's
+  `HeadlessChrome/<v>` tell without ever claiming a different OS. `M365_LOGIN_UA` unchanged.
+- **Locale and timezone are no longer defaulted at all.** Chromium already derives both from
+  the OS; anything we compute is at best identical and at worst wrong. Concretely: Node on
+  this host resolves the zone as `Etc/GMT-9` — a valid IANA id that no real Chrome reports —
+  so "derive it ourselves" would have *manufactured* a new tell. Both env vars still pin.
+- **The user-driven interactive path now sends no fingerprint overrides and no
+  `navigator.webdriver` mask.** A person is completing MFA in a visible window; every signal
+  AAD reads can be the truth. Masking there misrepresents a genuine human sign-in to the
+  tenant's risk engine, and buys nothing the human's presence doesn't already provide.
+**Falsification.** An automated login that passed on the old constants and fails on the
+host-derived UA (set the three env vars back to restore the previous behaviour exactly).
+
+### F34 — The give-up detectors were English-only too 🟢
+F28 fixed the remote-artifact guard; the two larger detectors had the same monolingual
+assumption. `looksLikeConfabulation` and `looksLikeHallucinatedCompletion` are now bilingual:
+Japanese give-up phrasings (アップロード/貼り付けの要求, 「〜できません」, 「見つかりません」,
+「ディレクトリは空」, 「別のセッションで」) and Japanese past-tense mutation claims
+(「修正しました」「作成しました」「以下が修正版のコードです」) are matched, with negative tests
+covering ordinary Japanese answers. All patterns avoid `\b` — it is ASCII-only in JS and never
+matches at a kana/kanji boundary, which is the trap that makes a naive port silently no-op.
+**Why it mattered.** The hallucination detector only fires when no tool ran all conversation,
+so in a Japanese session it had *nothing* to fire on: the model claimed the edit, no tool ran,
+and the caller was told the task succeeded.
+
+### Incidental — the startup auth gate does not gate
+`plugins/auth.ts` documents "a failure here throws and aborts boot … so the server never
+comes up half-broken". Under nitropack 2.x it does not: the rejection is reported as
+`[unhandledRejection]` and the server proceeds to listen. `/health` then answers
+`{"status":"ok"}` on a proxy that 502s every completion — misleading for the systemd unit
+in `nix/module.nix`, which has no other readiness signal.
 
 ---
 
