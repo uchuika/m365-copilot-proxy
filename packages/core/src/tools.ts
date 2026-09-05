@@ -288,6 +288,24 @@ const CONFABULATION_PATTERNS: RegExp[] = [
   // patterns because it says the session "does not expose" the filesystem.
   /(?:session|environment|runtime)\s+(?:does\s+not|doesn.?t|cannot)\s+(?:expose|mount|provide)\s+(?:the\s+)?(?:local\s+)?(?:repository\s+)?filesystem/i,
   /(?:my|the)\s+filesystem\s+(?:only\s+)?(?:contained|contains|has)[\s\S]{0,80}\/mnt\/data/i,
+
+  // --- Japanese ---
+  // The model answers in the language it was prompted in, so an English-only list
+  // leaves a non-English session with NO give-up detection at all: the forcing retry
+  // never fires and the failure reaches the caller looking like a finished answer.
+  // Observed live (§15 F26/F28) — every one of these is a real turn-1 give-up:
+  //   「calc.py がこちらの作業環境に見つからないため、まだ修正できません」
+  //   「calc.py をアップロードするか、ファイル内容を貼り付けてください」
+  //   「作業ディレクトリを確認しましたが、空でした」
+  // No `\b` anywhere: it is ASCII-only in JS and never matches at a kana/kanji edge.
+  /(?:アップロード|添付)(?:して)?(?:ください|下さい|いただけ|もらえ)/,
+  /(?:貼り付け|貼付|ペースト)(?:して)?(?:ください|下さい|いただけ|もらえ)/,
+  /(?:内容|中身|コード|ファイル)[^。\n]{0,24}(?:貼り付け|貼付|共有して|提供して)/,
+  /(?:アクセス|参照|取得|実行|一覧|確認|修正|編集|変更)[^。\n]{0,12}(?:でき|出来)(?:ません|ない|ず)/,
+  /(?:ファイル|ディレクトリ|フォルダ)[^。\n]{0,24}(?:見つかり|見つけられ)(?:ません|ませんでした)/,
+  /(?:作業|カレント|現在の)?(?:ディレクトリ|作業環境|ワークスペース)[^。\n]{0,24}(?:空|見当たり|存在しません)/,
+  /(?:ツール|シェル|コマンド|編集機能)[^。\n]{0,20}(?:利用できません|使用できません|ありません)/,
+  /(?:別|他)の(?:セッション|環境|ツール)[^。\n]{0,20}(?:で|にて)[^。\n]{0,20}(?:実行|やり直|再開)/,
 ];
 
 // M365 sometimes creates a real patch in its Teams-hosted remote artifact
@@ -300,14 +318,33 @@ const CONFABULATION_PATTERNS: RegExp[] = [
 // noun pattern (e.g. /generated .{0,100} patch/) fires on "I generated a patch for
 // review" and — because this detector fails closed below — turns an ordinary answer
 // into a 502. Anchors are what separate a remote artifact from a local one.
+// Mutation claims that qualify a Teams-artifact link as a *substituted* local
+// edit. The verb list is what keeps an ordinary shared link from firing, so it
+// has to cover the language the model is answering in — the patterns were
+// English-only, which made the whole guard inert for a non-English session (a
+// Japanese "修正しました" + a `views/original/` link sailed straight through and
+// the local file was never touched). Kept as one alternation so both the
+// verb→URL and URL→verb orders stay in sync.
+// `\b` is ASCII-only in JS, so the Japanese verbs carry no boundary assertion —
+// they are already specific enough not to need one.
+const MUTATION_CLAIM =
+  "(?:\\b(?:updated|modified|replaced|rewrote|saved|applied|prepared|created)\\b" +
+  "|修正|更新|置き換え|置換|書き換え|作成|保存|適用|変更|生成)";
+
 const REMOTE_ARTIFACT_COMPLETION_PATTERNS: RegExp[] = [
   /sandbox:\/mnt\/data\/[^\s)\]]+/i,
   /https?:\/\/[^\s)\]]*asyncgw\.teams\.microsoft\.com\/[^\s)\]]+\.(?:patch|diff)(?:[?#][^\s)\]]*)?/i,
   // The remote artifact may be the whole updated source file rather than a
   // patch. Require a mutation claim near the Teams "views/original" URL so a
   // normal shared link is not mistaken for a failed local edit.
-  /\b(?:updated|modified|replaced|rewrote|saved|applied|prepared|created)\b[\s\S]{0,600}https?:\/\/[^\s)\]]*asyncgw\.teams\.microsoft\.com\/[^\s)\]]*\/views\/original\//i,
-  /https?:\/\/[^\s)\]]*asyncgw\.teams\.microsoft\.com\/[^\s)\]]*\/views\/original\/[\s\S]{0,600}\b(?:updated|modified|replaced|rewrote|saved|applied|prepared|created)\b/i,
+  new RegExp(
+    `${MUTATION_CLAIM}[\\s\\S]{0,600}https?:\\/\\/[^\\s)\\]]*asyncgw\\.teams\\.microsoft\\.com\\/[^\\s)\\]]*\\/views\\/original\\/`,
+    "i",
+  ),
+  new RegExp(
+    `https?:\\/\\/[^\\s)\\]]*asyncgw\\.teams\\.microsoft\\.com\\/[^\\s)\\]]*\\/views\\/original\\/[\\s\\S]{0,600}${MUTATION_CLAIM}`,
+    "i",
+  ),
   // Live GPT-5.6 variant: "Updated [plan.md](<turn1file1 citation>) locally".
   // The private-use citation resolves to an M365 artifact, not the harness disk.
   /\b(?:updated|modified|replaced|rewrote|saved|applied)\b[\s\S]{0,180}\uE200cite\uE202turn\d+file\d+\uE201/i,
@@ -338,6 +375,16 @@ const HALLUCINATED_COMPLETION_PATTERNS: RegExp[] = [
   //  (b) an execution claim ("executed it with python3", "ran the script").
   /\b(?:created|wrote|written|generated|saved|added|produced|implemented|overwrote)\b[^.\n]{0,60}\b[\w-]{2,}\.[a-z]{1,4}\b/i,
   /\b(?:executed|ran|invoked|launched|compiled)\b[^.\n]{0,40}\b(?:it|them|this|the\s+(?:script|program|file|code|command|tests?)|python3?|node|\S{2,}\.[a-z]{1,4})\b/i,
+
+  // --- Japanese ---
+  // Same monolingual gap as CONFABULATION_PATTERNS. This detector only fires when NO
+  // tool ran in the whole conversation, so a past-tense mutation claim there is a
+  // claim about work that provably did not happen. Observed live: 「`add` 関数を修正
+  // し、基本的なテストを実行しました」 with the file untouched (§15 F28).
+  /(?:作成|修正|更新|置換|保存|上書き|書き換え|変更|追加|実装)(?:し|いたし)(?:ました|ています|ておきました)/,
+  /(?:実行|テスト|検証|確認)(?:し|いたし)(?:ました|ておきました)/,
+  /(?:完了|対応)(?:し|いたし)ました/,
+  /(?:以下|こちら)(?:が|は)[^。\n]{0,20}(?:修正版|更新版|新しい)の?(?:ファイル|コード|内容|バージョン)/,
 ];
 
 /**

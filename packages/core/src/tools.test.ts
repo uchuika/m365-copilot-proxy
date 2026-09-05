@@ -186,6 +186,21 @@ describe("looksLikeHallucinatedCompletion", () => {
     expect(looksLikeHallucinatedCompletion("The requested local edit is complete. No further changes are needed.")).toBe(true);
   });
 
+  // A non-English session had NO hallucination detection at all: every pattern
+  // required English. These are live strings from a Japanese pi run whose file was
+  // never touched (§15 F28).
+  it("flags Japanese past-tense mutation claims", () => {
+    expect(looksLikeHallucinatedCompletion("`add` 関数を修正し、基本的なテストを実行しました。")).toBe(true);
+    expect(looksLikeHallucinatedCompletion("calc.py を作成しました。")).toBe(true);
+    expect(looksLikeHallucinatedCompletion("設定ファイルを更新しておきました。")).toBe(true);
+    expect(looksLikeHallucinatedCompletion("以下が修正版のコードです。")).toBe(true);
+  });
+
+  it("does not flag Japanese answers that claim nothing", () => {
+    expect(looksLikeHallucinatedCompletion("この関数は 2 つの数を加算します。")).toBe(false);
+    expect(looksLikeHallucinatedCompletion("修正する必要がある箇所は 3 行目です。")).toBe(false);
+  });
+
   it("flags fakeable create-from-scratch hallucinations (no leading 'I')", () => {
     // The exact §8.12 failure string — bare "Created <file>" + "executed it".
     expect(looksLikeHallucinatedCompletion("Created fizzbuzz.py and executed it with python3.")).toBe(true);
@@ -264,6 +279,22 @@ That should be everything you need to get going quickly.`;
 });
 
 describe("looksLikeConfabulation", () => {
+  // Live strings from Japanese pi runs (§15 F26/F31). Without these the forcing
+  // retry never fired and the give-up was returned to the caller as a final answer.
+  it("flags Japanese give-up confabulations", () => {
+    expect(looksLikeConfabulation("`calc.py` がこちらの作業環境に見つからないため、まだ修正できません。")).toBe(true);
+    expect(looksLikeConfabulation("対象の `calc.py` をアップロードするか、コードを貼り付けてください。")).toBe(true);
+    expect(looksLikeConfabulation("作業ディレクトリを確認しましたが、空でした。")).toBe(true);
+    expect(looksLikeConfabulation("ファイル編集ツールが利用できません。")).toBe(true);
+    expect(looksLikeConfabulation("別のセッションで実行し直してください。")).toBe(true);
+  });
+
+  it("does not flag ordinary Japanese answers", () => {
+    expect(looksLikeConfabulation("calc.py の add 関数は 2 つの引数を取ります。")).toBe(false);
+    expect(looksLikeConfabulation("テストは 3 件すべて成功しています。")).toBe(false);
+    expect(looksLikeConfabulation("この変更で不具合は解消されます。")).toBe(false);
+  });
+
   it("flags real M365 give-up confabulations", () => {
     expect(looksLikeConfabulation("I'm unable to access or list any files in the working directory (all shell commands are returning no output).")).toBe(true);
     expect(looksLikeConfabulation("I don't have access to your project files or the ability to run python3 check.py here.")).toBe(true);
@@ -321,6 +352,19 @@ describe("looksLikeRemoteArtifactCompletion", () => {
   it("flags an entire updated file hosted in Teams instead of written locally", () => {
     const response = "Updated `plan.md` with `Status: complete`.\n\n[Download the updated plan.md](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-weu-d15-example/views/original/plan.md)";
     expect(looksLikeRemoteArtifactCompletion(response)).toBe(true);
+  });
+
+  // Observed live from a pi session prompted in Japanese: the model "fixed" the
+  // file in M365's sandbox and linked the result, leaving the local file
+  // untouched. The verb list was English-only, so the guard never fired and the
+  // failure reached the user as a successful-looking answer.
+  it("flags a Japanese mutation claim carrying a Teams artifact link", () => {
+    const response = "`add` 関数を修正し、基本的なテストを実行しました。\n\n修正版: [calc.py](https://kr-prod.asyncgw.teams.microsoft.com/v1/objects/0-ea-d2-example/views/original/calc.py)";
+    expect(looksLikeRemoteArtifactCompletion(response)).toBe(true);
+  });
+
+  it("still does not flag a Japanese answer that merely shares a link", () => {
+    expect(looksLikeRemoteArtifactCompletion("参考リンクはこちらです: https://kr-prod.asyncgw.teams.microsoft.com/v1/objects/0-ea-d2-example/views/original/calc.py")).toBe(false);
   });
 
   it("flags M365's sandbox path returned after a forced local-edit retry", () => {
